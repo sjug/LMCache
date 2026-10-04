@@ -627,6 +627,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 extra_config=vllm_config.kv_transfer_config.kv_connector_extra_config,
             )
             self.request_trackers: dict[str, LMCacheMPRequestTracker] = {}
+            # Loads remain pending until the scheduler consumes all ranks' output.
+            self._pending_loads: set[str] = set()
+            self._receive_owned_finished: set[str] = set()
 
             # GPU block pool reference
             self._gpu_block_pool: "BlockPool | None" = None
@@ -809,6 +812,18 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 vllm_config=self._vllm_config,
             )
         return
+
+    def bind_connector_metadata(self, connector_metadata: KVConnectorMetadata) -> None:
+        """Bind the step and apply scheduler-selected completion ownership.
+
+        Args:
+            connector_metadata: Metadata built by the scheduler for this step.
+        """
+        assert isinstance(connector_metadata, LMCacheMPConnectorMetadata)
+        super().bind_connector_metadata(connector_metadata)
+        self.worker_adapter.mark_receive_owned_finished(
+            connector_metadata.receive_owned_finished
+        )
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
         """
@@ -1280,6 +1295,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             scheduler_output (SchedulerOutput): the scheduler output object.
         """
         metadata = LMCacheMPConnectorMetadata()
+        metadata.receive_owned_finished = self._receive_owned_finished
+        self._receive_owned_finished = set()
         metadata.need_flush_before_forward = _has_preemption_reqs(scheduler_output)
 
         self._process_retrieve_requests(metadata)
@@ -1298,10 +1315,14 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         """
         Update KVConnector state from worker-side connectors output.
 
+        Load ownership ends only when the scheduler consumes the aggregated
+        receive report, not when individual workers finish their futures.
+
         Args:
             connector_output (KVConnectorOutput): the worker-side
                 connectors output.
         """
+        self._pending_loads.difference_update(connector_output.finished_recving or ())
         if not self.lazy_offload:
             return
         if not self._gpu_block_pool:
@@ -1329,6 +1350,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
 
         The connector may assumes responsibility for freeing the blocks
         asynchronously by returning True.
+
+        If a load is still pending, vLLM already holds its blocks until receive
+        completion. Notify workers not to produce a second send completion.
 
         Returns:
             True if the request is being saved/sent asynchronously and blocks
@@ -1367,6 +1391,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
 
         if self.lazy_offload:
             self._pending_store.mark_req_finished(request.request_id)
+            return False, (return_params or None)
+        if request.request_id in self._pending_loads:
+            self._receive_owned_finished.add(request.request_id)
             return False, (return_params or None)
         return True, (return_params or None)
 
@@ -1472,6 +1499,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             )
             if r_metadata is not None:
                 metadata.add_request_metadata(r_metadata)
+                self._pending_loads.add(request_tracker.request_id)
             request_tracker.state = LMCacheMPRequestState.READY
 
     def _process_new_requests(

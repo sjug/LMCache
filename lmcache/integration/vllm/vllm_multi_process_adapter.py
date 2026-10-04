@@ -1259,9 +1259,11 @@ class LMCacheMPWorkerAdapter:
         # The finished request ids that are passed via vLLM and also
         # have corresponding store requests submitted to LMCache before
         self.previously_finished: set[str] = set()
-        # Request IDs already returned as finished_sending to the scheduler.
-        # Prevents re-reporting the same ID after drain clears tracking sets.
+        # Request IDs whose send completion was reported or consumed by an
+        # aborted retrieve. Suppression survives duplicate engine notices.
         self._returned_finished: set[str] = set()
+        # Completed retrieves waiting for stores to release GPU blocks.
+        self._deferred_finished_retrieves: set[str] = set()
 
         self.model_name = model_name
         self.parallel_strategy = parallel_strategy
@@ -1771,8 +1773,10 @@ class LMCacheMPWorkerAdapter:
         finished_req_ids_from_lmcache: set[str],
         finished_req_ids_from_engine: set[str],
     ) -> set[str]:
-        """Merge LMCache-side and engine-side finished store info."""
-        self.finished_stores.update(finished_req_ids_from_lmcache)
+        """Merge store completions, excluding requests owned by receive cleanup."""
+        self.finished_stores.update(
+            finished_req_ids_from_lmcache - self._returned_finished
+        )
         ret_stores = set()
         for req_id in finished_req_ids_from_engine:
             if req_id in self._returned_finished:
@@ -1784,6 +1788,20 @@ class LMCacheMPWorkerAdapter:
         ret_stores.update(self._update_and_get_finished_store())
         self._returned_finished.update(ret_stores)
         return ret_stores
+
+    def mark_receive_owned_finished(self, request_ids: set[str]) -> None:
+        """Suppress sends for aborts the scheduler will free on receive.
+
+        Args:
+            request_ids: Scheduler-selected receive-owned finished requests.
+                This must be applied before polling engine finish notices.
+
+        A worker may have reported its load before the scheduler consumes that
+        report. Only the scheduler can choose which completion frees blocks.
+        """
+        self._returned_finished.update(request_ids)
+        self.finished_stores.difference_update(request_ids)
+        self.previously_finished.difference_update(request_ids)
 
     @_lmcache_nvtx_annotate
     def get_finished(
@@ -1810,6 +1828,10 @@ class LMCacheMPWorkerAdapter:
             multiple times in `finished_req_ids_from_engine`. The adapter should
             take care of deduplicating the request IDs and only return the request
             IDs that have not been returned before.
+            Retrieves wait for outstanding stores before reporting completion:
+            the scheduler can abort the request before processing the report.
+            Receive-owned aborts must be marked with
+            ``mark_receive_owned_finished`` before polling their finish notices.
         """
         if self.dispatcher is not None:
             dispatch(self.dispatcher, "reclaim")
@@ -1838,16 +1860,11 @@ class LMCacheMPWorkerAdapter:
             self._dropped_retrieves = set()
             finished_retrieves.update(dropped)
 
-            ret_stores = self._process_finished_stores(
-                finished_stores, finished_req_ids_from_engine
+            return self._process_finished_transfers(
+                finished_stores,
+                finished_retrieves,
+                finished_req_ids_from_engine,
             )
-            # A request may have a pending retrieve AND appear in
-            # finished_req_ids_from_engine (it ran without loading KV after
-            # the server died).  The scheduler processes finished_recving
-            # first and deletes the request, so we must not also report it
-            # in finished_sending.
-            ret_stores -= finished_retrieves
-            return ret_stores, finished_retrieves
 
         finished_stores = set()
         finished_retrieves = set()
@@ -1889,19 +1906,18 @@ class LMCacheMPWorkerAdapter:
             self.retrieve_futures.pop(request_id, None)
             self.retrieve_events.pop(request_id, None)
 
-        # Retrieves dropped while unhealthy still must be reported,
-        # exactly once, or async loads hang in WAITING_FOR_REMOTE_KVS. No
-        # finished_sending dedup is needed (unlike the unhealthy branch): a
-        # dropped retrieve's request is parked in WAITING_FOR_REMOTE_KVS until
-        # this report, so it cannot also be engine-finished in the same call.
+        # Dropped retrieves still need completion, including when aborted
+        # while parked in WAITING_FOR_REMOTE_KVS.
         # Swap-drain so a concurrent submit_retrieve_request add is never lost.
         dropped = self._dropped_retrieves
         self._dropped_retrieves = set()
         finished_retrieves.update(dropped)
 
         # Update the internal states
-        ret_stores = self._process_finished_stores(
-            finished_stores, finished_req_ids_from_engine
+        ret_stores, finished_retrieves = self._process_finished_transfers(
+            finished_stores,
+            finished_retrieves,
+            finished_req_ids_from_engine,
         )
 
         # the invocation of `get_finished` means that
@@ -2117,6 +2133,25 @@ class LMCacheMPWorkerAdapter:
         self.request_telemetry.close()
 
     # Helper functions
+    def _process_finished_transfers(
+        self,
+        finished_stores: set[str],
+        finished_retrieves: set[str],
+        finished_req_ids_from_engine: set[str],
+    ) -> tuple[set[str], set[str]]:
+        """Give aborted loads exclusive cleanup ownership until transfers finish."""
+        ret_stores = self._process_finished_stores(
+            finished_stores, finished_req_ids_from_engine
+        )
+        finished_retrieves.update(self._deferred_finished_retrieves)
+        # An abort can reach the scheduler after a rank reports its receive.
+        # Hold every receive until its stores finish, not just known aborts.
+        self._deferred_finished_retrieves = (
+            finished_retrieves & self.store_futures.keys()
+        )
+        finished_retrieves.difference_update(self._deferred_finished_retrieves)
+        return ret_stores, finished_retrieves
+
     def _update_and_get_finished_store(
         self,
     ) -> set[str]:

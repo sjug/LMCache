@@ -4,6 +4,7 @@ stubbed (see ``fake_adapter``); no GPU or live server needed. End-to-end
 recovery: ``.buildkite/k3_tests/multiprocess/scripts/run-restart-recovery.sh``."""
 
 # Standard
+from types import SimpleNamespace
 from typing import Callable, ClassVar
 from unittest.mock import MagicMock
 import gc
@@ -536,6 +537,186 @@ def test_store_keeps_event_until_future_finishes(fake_adapter):
     transfer_ctx.reset_mock()
     gc.collect()
     assert event_ref() is None
+
+
+@pytest.mark.parametrize(
+    "retrieve_step,store_step", [(0, None), (2, None), (0, 2), (2, 0), (2, 2)]
+)
+@pytest.mark.parametrize("retrieve_ok", [True, False])
+@pytest.mark.parametrize("repeat_finish", [False, True])
+def test_abort_during_retrieve_has_one_completion(
+    fake_adapter,
+    retrieve_step: int,
+    store_step: int | None,
+    retrieve_ok: bool,
+    repeat_finish: bool,
+) -> None:
+    """An aborted load owns completion until both DMA directions finish."""
+    adapter, _, _ = fake_adapter
+    transfer = MagicMock()
+    load = transfer.submit_retrieve.return_value
+    store = transfer.submit_store.return_value
+    load.result.return_value = retrieve_ok
+    store.result.return_value = True
+    adapter.transfer_ctx = transfer
+    if store_step is not None:
+        adapter.submit_store_request("aborted", _op([[7]]), None)
+    adapter.submit_retrieve_request("aborted", _op([[7]]), None)
+
+    adapter.mark_receive_owned_finished({"aborted"})
+    terminal_step = max(retrieve_step, store_step or 0)
+    for step in range(4):
+        load.query.return_value = step >= retrieve_step
+        store.query.return_value = store_step is not None and step >= store_step
+        # Async scheduling can repeat the engine's finish notification.
+        finished = {"aborted"} if step == 0 or repeat_finish else set()
+        sending, receiving = adapter.get_finished(finished)
+        assert sending == set()
+        assert receiving == ({"aborted"} if step == terminal_step else set())
+    assert adapter.get_block_ids_with_load_errors() == (set() if retrieve_ok else {7})
+
+
+@pytest.mark.parametrize("recover", [False, True])
+def test_aborted_dropped_retrieve_never_reports_sending(
+    fake_adapter, recover: bool
+) -> None:
+    """Dropped loads still use only the receive completion channel after abort."""
+    adapter, _, _ = fake_adapter
+    adapter.transfer_ctx = MagicMock()
+    FakeHeartbeatThread.start_hook = lambda hb: hb.health_event.clear()
+    adapter.submit_retrieve_request("aborted", _op([[7]]), None)
+    if recover:
+        FakeHeartbeatThread.instances[0].simulate_successful_ping()
+    adapter.mark_receive_owned_finished({"aborted"})
+    assert adapter.get_finished({"aborted"}) == (set(), {"aborted"})
+    assert adapter.get_finished({"aborted"}) == (set(), set())
+    assert adapter.get_block_ids_with_load_errors() == {7}
+
+
+def test_abort_pending_retrieve_after_health_loss(fake_adapter) -> None:
+    """The unhealthy drain cannot emit another completion on a later poll."""
+    adapter, _, _ = fake_adapter
+    adapter.transfer_ctx = MagicMock()
+    adapter.transfer_ctx.submit_retrieve.return_value.query.return_value = False
+    adapter.submit_retrieve_request("aborted", _op([[7]]), None)
+    FakeHeartbeatThread.instances[0].health_event.clear()
+    adapter.mark_receive_owned_finished({"aborted"})
+    assert adapter.get_finished({"aborted"}) == (set(), {"aborted"})
+    assert adapter.get_finished({"aborted"}) == (set(), set())
+
+
+def test_finish_after_reported_retrieve_still_reports_sending(fake_adapter) -> None:
+    """A load reported before engine completion does not own final cleanup."""
+    adapter, _, _ = fake_adapter
+    adapter.transfer_ctx = MagicMock()
+    adapter.submit_retrieve_request("normal", _op([[7]]), None)
+    assert adapter.get_finished(set()) == (set(), {"normal"})
+    assert adapter.get_finished({"normal"}) == ({"normal"}, set())
+    assert adapter.get_finished({"normal"}) == (set(), set())
+
+
+@pytest.mark.parametrize("abort", [False, True])
+def test_receive_waits_for_store_before_abort_is_known(
+    fake_adapter, abort: bool
+) -> None:
+    """Another rank can complete an aborted receive before this rank's store."""
+    adapter, _, _ = fake_adapter
+    transfer = MagicMock()
+    adapter.transfer_ctx = transfer
+    transfer.submit_store.return_value.query.return_value = False
+    adapter.submit_store_request("overlap", _op([[7]]), None)
+    adapter.submit_retrieve_request("overlap", _op([[7]]), None)
+    assert adapter.get_finished(set()) == (set(), set())
+    finished = {"overlap"} if abort else set()
+    if abort:
+        adapter.mark_receive_owned_finished(finished)
+    assert adapter.get_finished(finished) == (set(), set())
+    transfer.submit_store.return_value.query.return_value = True
+    assert adapter.get_finished(set()) == (set(), {"overlap"})
+    assert adapter.get_finished({"overlap"}) == (set() if abort else {"overlap"}, set())
+
+
+@pytest.mark.parametrize("scheduler_received", [False, True])
+def test_scheduler_owns_abort_with_queued_receive_output(
+    fake_adapter, monkeypatch: pytest.MonkeyPatch, scheduler_received: bool
+) -> None:
+    """A worker's completed load is not necessarily consumed by the scheduler."""
+    connector_mod = pytest.importorskip("lmcache.integration.vllm.lmcache_mp_connector")
+    adapter, _, _ = fake_adapter
+    adapter.transfer_ctx = MagicMock()
+    scheduler_adapter = MagicMock(lmcache_tokens_per_chunk=256)
+    scheduler_adapter.check_lookup_result.return_value = 256
+    monkeypatch.setattr(
+        connector_mod, "LMCacheMPSchedulerAdapter", lambda **kw: scheduler_adapter
+    )
+    monkeypatch.setattr(connector_mod, "LMCacheMPWorkerAdapter", lambda **kw: adapter)
+    for name in (
+        "validate_mamba_step_alignment",
+        "validate_kv_cache_groups",
+        "validate_dcp_support",
+    ):
+        monkeypatch.setattr(connector_mod, name, lambda *a: None)
+    monkeypatch.setattr(connector_mod, "get_group_tokens_per_block", lambda *a: [16])
+    monkeypatch.setattr(connector_mod, "get_vllm_scheduler_block_size", lambda *a: 16)
+    monkeypatch.setattr(
+        connector_mod, "get_dcp_decorated_model_name", lambda *a: "test"
+    )
+    monkeypatch.setattr(
+        connector_mod,
+        "build_parallel_strategy_from_vllm_config",
+        lambda *a: SimpleNamespace(dcp_size=1, vllm_world_size=1, vllm_worker_id=0),
+    )
+    config = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(
+            get_from_extra_config=lambda key, default: default,
+            kv_connector_extra_config={},
+        ),
+        parallel_config=SimpleNamespace(world_size=1, data_parallel_size=1),
+    )
+    scheduler = connector_mod.LMCacheMPConnector(
+        config, connector_mod.KVConnectorRole.SCHEDULER
+    )
+    worker = connector_mod.LMCacheMPConnector(
+        config, connector_mod.KVConnectorRole.WORKER
+    )
+    request = SimpleNamespace(
+        request_id="queued",
+        status=connector_mod.RequestStatus.WAITING,
+        all_token_ids=list(range(512)),
+        prompt_token_ids=list(range(512)),
+        cache_salt="",
+        mm_features=[],
+        sampling_params=None,
+        kv_transfer_params=None,
+        num_computed_tokens=0,
+    )
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (256, True)
+    blocks = MagicMock()
+    blocks.get_block_ids.return_value = (list(range(16)),)
+    scheduler.update_state_after_alloc(request, blocks, 256)
+    output = SimpleNamespace(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(req_ids=[]),
+        preempted_req_ids=set(),
+        total_num_scheduled_tokens=0,
+    )
+    worker.bind_connector_metadata(scheduler.build_connector_meta(output))
+    worker.start_load_kv(None)
+    sends, receives = worker.get_finished(set())
+    assert (sends, receives) == (set(), {"queued"})
+    if scheduler_received:
+        scheduler.update_connector_output(
+            connector_mod.KVConnectorOutput(finished_recving=receives)
+        )
+    request.status = connector_mod.RequestStatus.FINISHED_ABORTED
+    delay_free, _ = scheduler.request_finished(request, [])
+    assert delay_free is scheduler_received
+    worker.bind_connector_metadata(scheduler.build_connector_meta(output))
+    assert worker.get_finished({"queued"}) == (
+        {"queued"} if scheduler_received else set(),
+        set(),
+    )
+    assert worker.get_finished({"queued"}) == (set(), set())
 
 
 def test_retrieve_keeps_event_until_future_finishes(fake_adapter):
